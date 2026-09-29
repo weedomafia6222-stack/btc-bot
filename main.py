@@ -1,4 +1,7 @@
+import os
 import time
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import ccxt
 import pandas as pd
 import requests
@@ -11,7 +14,7 @@ TELEGRAM_CHAT_ID   = "1327677831"
 
 SYMBOL = "BTC/USDT"
 RR_RATIO = 1.2          # 1:1.2 High Win-Rate Scalp Target
-EMA_PERIOD = 200        # Major Trend Filter (No counter-trend trades)
+EMA_PERIOD = 200        # Major Trend Filter
 SWING_LOOKBACK = 15     # Recent Liquidity Swings (~1 Hour)
 COOLDOWN_MINUTES = 20   # Avoid double entries
 
@@ -33,12 +36,10 @@ def get_5m_candles(limit=250):
     ohlcv = exchange.fetch_ohlcv(SYMBOL, timeframe='5m', limit=limit)
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms').dt.tz_localize('UTC').dt.tz_convert('Asia/Kolkata')
-    
-    # Calculate 200 EMA
     df['ema200'] = df['close'].ewm(span=EMA_PERIOD, adjust=False).mean()
     return df
 
-def run_bot():
+def trading_bot_loop():
     print("🚀 BTC 75%+ Win-Rate Pro Scalper Active...")
     send_telegram_alert("🎯 *Gujju 75%+ Scalper Mode Activated!* \nTracking Trend Sweeps with 200 EMA Filter on BTC/USDT (5m).")
     
@@ -51,20 +52,17 @@ def run_bot():
             df = get_5m_candles(limit=250)
             now_ist = datetime.now(pytz.timezone('Asia/Kolkata'))
 
-            # Daily Reset
             if current_day != now_ist.day:
                 current_day = now_ist.day
                 trades_count = 0
 
-            # Dynamic Swing Levels
             recent_high = df['high'].iloc[-(SWING_LOOKBACK + 2):-2].max()
             recent_low  = df['low'].iloc[-(SWING_LOOKBACK + 2):-2].min()
 
-            last_closed = df.iloc[-2]  # Trigger candle
+            last_closed = df.iloc[-2]
             curr_price  = df.iloc[-1]['close']
             ema_val     = last_closed['ema200']
 
-            # Check Cooldown
             cooldown_passed = True
             if last_trade_time:
                 diff = (now_ist - last_trade_time).total_seconds() / 60
@@ -72,7 +70,7 @@ def run_bot():
                     cooldown_passed = False
 
             if cooldown_passed:
-                # 1. HIGH-PROBABILITY SHORT: Downtrend (Price < 200 EMA) + High Liquidity Sweep
+                # SHORT Setup
                 if (last_closed['close'] < ema_val and 
                     last_closed['high'] > recent_high and 
                     last_closed['close'] < recent_high and 
@@ -98,7 +96,7 @@ def run_bot():
                     )
                     send_telegram_alert(alert_msg)
 
-                # 2. HIGH-PROBABILITY LONG: Uptrend (Price > 200 EMA) + Low Liquidity Sweep
+                # LONG Setup
                 elif (last_closed['close'] > ema_val and 
                       last_closed['low'] < recent_low and 
                       last_closed['close'] > recent_low and 
@@ -130,5 +128,26 @@ def run_bot():
             print(f"Loop Error: {e}")
             time.sleep(10)
 
+# Dummy Server to keep Render Free Web Service happy
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b"Bot is healthy and running!")
+
+    def log_message(self, format, *args):
+        return  # Mute server logs
+
+def run_dummy_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    server.serve_forever()
+
 if __name__ == "__main__":
-    run_bot()
+    # Start bot loop in background
+    bot_thread = threading.Thread(target=trading_bot_loop, daemon=True)
+    bot_thread.start()
+    
+    # Start port server for Render
+    run_dummy_server()
