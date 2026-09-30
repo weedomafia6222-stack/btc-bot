@@ -9,20 +9,16 @@ import requests
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ----------------- CONFIGURATION -----------------
-TELEGRAM_BOT_TOKEN = "8608122374:AAF5OXFFo4pKrhda8RyThOCs9dN0zkd0V14"    # Apna Bot Token dalein
-TELEGRAM_CHAT_ID   = "1327677831"      # Apna Chat ID dalein
+TELEGRAM_BOT_TOKEN = "8608122374:AAF5OXFFo4pKrhda8RyThOCs9dN0zkd0V14"
+TELEGRAM_CHAT_ID   = "1327677831"
 
 SYMBOL = "BTC/USDT"
 TIMEFRAME = "5m"
-EMA_PERIOD = 50          # Dynamic EMA trend filter
-SWING_LOOKBACK = 8       # 40-minute lookback for active sweeps
+EMA_PERIOD = 20           # Dynamic intraday pullback EMA
 RR_RATIO = 1.3
-COOLDOWN_MINUTES = 12
+COOLDOWN_MINUTES = 10
 
-# Coinbase bilkul US cloud-friendly hai (Zero Location Block)
-exchange = ccxt.coinbase({
-    'enableRateLimit': True
-})
+exchange = ccxt.coinbase({'enableRateLimit': True})
 
 def send_telegram_alert(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -48,8 +44,8 @@ def fetch_btc_data():
         return None
 
 def btc_scalper_worker():
-    print("🚀 BTC Scalper Engine Live (Coinbase Feed - Geo Block Free)...", flush=True)
-    send_telegram_alert("🚀 *BTC/USDT LIVE BOT ENGAGED!*\nBypassed cloud restrictions. Monitoring live 5m candles.")
+    print("🚀 BTC Pullback Scalper Engine Started...", flush=True)
+    send_telegram_alert("🚀 *BTC/USDT PULLBACK BOT ENGAGED!*\nTracking 5m 20-EMA dynamic pullbacks.")
 
     last_trade_time = None
     trades_count = 0
@@ -63,13 +59,12 @@ def btc_scalper_worker():
 
             if df is not None and len(df) > EMA_PERIOD:
                 curr_price = df.iloc[-1]['close']
-                last_closed = df.iloc[-2]
-                ema_val = last_closed['ema']
+                last = df.iloc[-2]
+                ema_val = last['ema']
+                is_green = last['close'] > last['open']
+                is_red   = last['close'] < last['open']
 
-                recent_high = df['high'].iloc[-(SWING_LOOKBACK + 2):-2].max()
-                recent_low  = df['low'].iloc[-(SWING_LOOKBACK + 2):-2].min()
-
-                print(f"[{now_ist.strftime('%H:%M:%S')}] BTC: ${curr_price:,.2f} | EMA: ${ema_val:,.2f} | Scanning...", flush=True)
+                print(f"[{now_ist.strftime('%H:%M:%S')}] BTC: ${curr_price:,.2f} | 20-EMA: ${ema_val:,.2f} | Scanning...", flush=True)
 
                 cooldown_passed = True
                 if last_trade_time:
@@ -78,12 +73,9 @@ def btc_scalper_worker():
                         cooldown_passed = False
 
                 if cooldown_passed:
-                    # LONG SETUP
-                    if (last_closed['close'] > ema_val and 
-                        last_closed['low'] < recent_low and 
-                        last_closed['close'] > recent_low):
-
-                        sl_pts = round(curr_price - last_closed['low'] + 25, 2)
+                    # 1. Bullish Pullback (Dip to 20-EMA + Green Bounce)
+                    if last['close'] > ema_val and last['low'] <= (ema_val + 35) and is_green:
+                        sl_pts = round(curr_price - last['low'] + 30, 2)
                         tp_pts = round(sl_pts * RR_RATIO, 2)
                         target_price = round(curr_price + tp_pts, 2)
                         stop_price = round(curr_price - sl_pts, 2)
@@ -92,22 +84,18 @@ def btc_scalper_worker():
                         last_trade_time = now_ist
 
                         msg = (
-                            f"🟢 *BTC/USDT LONG SCALP CALL #{trades_count}* 🟢\n\n"
+                            f"🟢 *BTC/USDT LONG PULLBACK #{trades_count}* 🟢\n\n"
                             f"🔹 *Entry Price:* ${curr_price:,.2f}\n"
                             f"🎯 *Take Profit:* ${target_price:,.2f} (+${tp_pts})\n"
                             f"🛑 *Stop Loss:* ${stop_price:,.2f} (-${sl_pts})\n"
-                            f"📈 *Trend:* Bullish (> EMA {EMA_PERIOD})\n"
-                            f"📊 *Sweep:* Swept recent low (${recent_low:,.2f})\n\n"
-                            f"⚡ *Tip:* Book 50% profit at 1:1 RR and trail SL to entry."
+                            f"📈 *Setup:* 20-EMA Dynamic Support Bounce\n\n"
+                            f"⚡ *Tip:* Book 50% profit at 1:1 and trail SL to entry."
                         )
                         send_telegram_alert(msg)
 
-                    # SHORT SETUP
-                    elif (last_closed['close'] < ema_val and 
-                          last_closed['high'] > recent_high and 
-                          last_closed['close'] < recent_high):
-
-                        sl_pts = round(last_closed['high'] - curr_price + 25, 2)
+                    # 2. Bearish Pullback (Rally to 20-EMA + Red Rejection)
+                    elif last['close'] < ema_val and last['high'] >= (ema_val - 35) and is_red:
+                        sl_pts = round(last['high'] - curr_price + 30, 2)
                         tp_pts = round(sl_pts * RR_RATIO, 2)
                         target_price = round(curr_price - tp_pts, 2)
                         stop_price = round(curr_price + sl_pts, 2)
@@ -116,20 +104,19 @@ def btc_scalper_worker():
                         last_trade_time = now_ist
 
                         msg = (
-                            f"🔴 *BTC/USDT SHORT SCALP CALL #{trades_count}* 🔴\n\n"
+                            f"🔴 *BTC/USDT SHORT PULLBACK #{trades_count}* 🔴\n\n"
                             f"🔹 *Entry Price:* ${curr_price:,.2f}\n"
                             f"🎯 *Take Profit:* ${target_price:,.2f} (-${tp_pts})\n"
                             f"🛑 *Stop Loss:* ${stop_price:,.2f} (+${sl_pts})\n"
-                            f"📉 *Trend:* Bearish (< EMA {EMA_PERIOD})\n"
-                            f"📊 *Sweep:* Swept recent high (${recent_high:,.2f})\n\n"
-                            f"⚡ *Tip:* Book 50% profit at 1:1 RR and trail SL to entry."
+                            f"📉 *Setup:* 20-EMA Dynamic Resistance Rejection\n\n"
+                            f"⚡ *Tip:* Book 50% profit at 1:1 and trail SL to entry."
                         )
                         send_telegram_alert(msg)
 
             time.sleep(20)
 
         except Exception as e:
-            print(f"Loop Exception: {e}", flush=True)
+            print(f"BTC Loop Notice: {e}", flush=True)
             time.sleep(15)
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -137,7 +124,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-type', 'text/plain')
         self.end_headers()
-        self.wfile.write(b"BTC Bot Healthy & Scanning!")
+        self.wfile.write(b"BTC Pullback Bot Healthy!")
 
     def log_message(self, format, *args):
         return
