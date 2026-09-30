@@ -1,34 +1,48 @@
 import os
 import time
 import threading
-from datetime import datetime
-import pytz
+import requests
 import ccxt
 import pandas as pd
-import requests
+from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ----------------- CONFIGURATION -----------------
 TELEGRAM_BOT_TOKEN = "8608122374:AAF5OXFFo4pKrhda8RyThOCs9dN0zkd0V14"
 TELEGRAM_CHAT_ID   = "1327677831"
 
-HTF_TIMEFRAME = "15m"   # Institutional Liquidity & Bias
-LTF_TIMEFRAME = "5m"    # CHoCH & FVG Entry Execution
-
-COOLDOWN_MINUTES = 12
-
-ASSETS = {
-    "BTC/USDT":  {"name": "BITCOIN",    "min_fvg": 15.0,  "sl_buf": 20.0, "rr": 2.0},
-    "ETH/USDT":  {"name": "ETHEREUM",   "min_fvg": 1.5,   "sl_buf": 2.0,  "rr": 2.0},
-    "SOL/USDT":  {"name": "SOLANA",     "min_fvg": 0.20,  "sl_buf": 0.25, "rr": 2.0},
-    "PAXG/USD":  {"name": "GOLD (SPOT)", "min_fvg": 1.5,   "sl_buf": 2.0,  "rr": 2.0}
+PAIRS = {
+    "BTC/USD": {
+        "name": "BTC/USD (BITCOIN)",
+        "min_fvg": 40.0,
+        "sl_buf": 35.0,
+        "rr": 2.0
+    },
+    "ETH/USD": {
+        "name": "ETH/USD (ETHEREUM)",
+        "min_fvg": 4.0,
+        "sl_buf": 3.0,
+        "rr": 2.0
+    },
+    "SOL/USD": {
+        "name": "SOL/USD (SOLANA)",
+        "min_fvg": 0.5,
+        "sl_buf": 0.4,
+        "rr": 2.0
+    },
+    "PAXG/USD": {
+        "name": "PAXG/USD (GOLD (SPOT))",
+        "min_fvg": 1.5,
+        "sl_buf": 2.0,
+        "rr": 2.0
+    }
 }
 
-exchange = ccxt.coinbase({'enableRateLimit': True})
-last_trade_times = {symbol: None for symbol in ASSETS}
-trade_counts = {symbol: 0 for symbol in ASSETS}
-last_checked_candles = {symbol: None for symbol in ASSETS}
+COOLDOWN_MINUTES = 25
+last_signal_time = {pair: 0 for pair in PAIRS}
+signal_counters  = {pair: 0 for pair in PAIRS}
 
+# ----------------- TELEGRAM NOTIFIER -----------------
 def send_telegram_alert(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -39,9 +53,12 @@ def send_telegram_alert(message):
     try:
         requests.post(url, data=payload, timeout=10)
     except Exception as e:
-        print(f"Telegram Error: {e}", flush=True)
+        print(f"Telegram Alert Error: {e}", flush=True)
 
-def fetch_data(symbol, timeframe, limit=60):
+# ----------------- DATA FETCHER -----------------
+exchange = ccxt.coinbase({'enableRateLimit': True})
+
+def fetch_candles(symbol, timeframe='5m', limit=50):
     try:
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -50,149 +67,146 @@ def fetch_data(symbol, timeframe, limit=60):
         print(f"Fetch Error ({symbol} {timeframe}): {e}", flush=True)
         return None
 
+# ----------------- STRICT SMC & ICT STRATEGY ENGINE -----------------
 def check_smc_setup(df_htf, df_ltf, cfg):
     """
-    SMC/ICT Confluence Logic:
-    1. HTF (15m): Swing High / Low Liquidity Sweep
-    2. LTF (5m): Change of Character (CHoCH) via Displacement
-    3. LTF (5m): Fair Value Gap (FVG) retest entry
+    STRICT INSTITUTIONAL CONFIRMATION:
+    1. 15m Liquidity Sweep (BSL / SSL)
+    2. MUST have 5m Candle BODY CLOSE (Real CHoCH)
+    3. Retracement into Fair Value Gap (FVG Zone)
     """
-    if df_htf is None or df_ltf is None or len(df_htf) < 20 or len(df_ltf) < 20:
+    if len(df_htf) < 20 or len(df_ltf) < 20:
         return None
 
-    # --- 1. HTF LIQUIDITY SWEEP CHECK ---
-    htf_recent = df_htf.iloc[-10:-2]
-    htf_prev_high = htf_recent['high'].max()
-    htf_prev_low  = htf_recent['low'].min()
-    
-    htf_last = df_htf.iloc[-2]  # Last closed 15m candle
-    bullish_sweep = (htf_last['low'] < htf_prev_low) and (htf_last['close'] > htf_prev_low)
-    bearish_sweep = (htf_last['high'] > htf_prev_high) and (htf_last['close'] < htf_prev_high)
+    # 15m Higher Timeframe Swing Points (Past 15 candles)
+    htf_high = df_htf['high'].iloc[-16:-1].max()
+    htf_low  = df_htf['low'].iloc[-16:-1].min()
 
-    # --- 2. LTF (5m) CHoCH & FVG CONFIRMATION ---
-    c1 = df_ltf.iloc[-4]
-    c2 = df_ltf.iloc[-3]  # Displacement candle
-    c3 = df_ltf.iloc[-2]  # Re-test / Entry candle
-    curr = df_ltf.iloc[-1]
+    # 15m Sweeps (Wick pierced past swing, body stayed back)
+    htf_ssl_sweep = (df_htf['low'].iloc[-1] < htf_low) and (df_htf['close'].iloc[-1] > htf_low)
+    htf_bsl_sweep = (df_htf['high'].iloc[-1] > htf_high) and (df_htf['close'].iloc[-1] < htf_high)
 
-    curr_price = curr['close']
+    # 5m Lower Timeframe Swings for CHoCH
+    ltf_swing_high = df_ltf['high'].iloc[-12:-2].max()
+    ltf_swing_low  = df_ltf['low'].iloc[-12:-2].min()
 
-    # --- BULLISH SMC SETUP (BUY) ---
-    # FVG condition: c1['high'] < c3['low']
-    bull_fvg_gap = c3['low'] - c1['high']
-    ltf_swing_high = df_ltf.iloc[-12:-4]['high'].max()
-    choch_bullish = c2['close'] > ltf_swing_high  # Displacement break above swing high
+    # 5m Candles for FVG Analysis
+    c0 = df_ltf.iloc[-3]
+    c1 = df_ltf.iloc[-2]
+    c2 = df_ltf.iloc[-1]
+    curr_price = c2['close']
 
-    if (bullish_sweep or choch_bullish) and (bull_fvg_gap >= cfg['min_fvg']):
-        # Pullback into FVG zone (50% Consequent Encroachment)
-        fvg_mid = c1['high'] + (bull_fvg_gap * 0.5)
-        if c3['low'] <= c3['high'] and curr_price >= fvg_mid:
-            sl_price = round(min(c2['low'], c3['low']) - cfg['sl_buf'], 2)
-            risk_dist = curr_price - sl_price
-            if risk_dist > 0:
-                tp_price = round(curr_price + (risk_dist * cfg['rr']), 2)
+    # --- 1. BULLISH SETUP ---
+    bullish_choch = c1['close'] > ltf_swing_high
+    bull_fvg_gap = c2['low'] - c0['high']
+
+    if htf_ssl_sweep and bullish_choch and (bull_fvg_gap >= cfg['min_fvg']):
+        fvg_top = c2['low']
+        fvg_bottom = c0['high']
+        # Price must be actively retesting the FVG zone
+        if fvg_bottom <= curr_price <= fvg_top:
+            sl = round(ltf_swing_low - cfg['sl_buf'], 2)
+            risk = curr_price - sl
+            if risk > 0:
+                tp = round(curr_price + (risk * cfg['rr']), 2)
                 return {
                     "side": "LONG",
-                    "entry": round(curr_price, 2),
-                    "sl": sl_price,
-                    "tp": tp_price,
-                    "risk": round(risk_dist, 2),
-                    "target_gain": round(risk_dist * cfg['rr'], 2),
-                    "confluence": "15m SSL Sweep + 5m CHoCH + Bullish FVG Tap"
+                    "entry": curr_price,
+                    "sl": sl,
+                    "tp": tp,
+                    "fvg_size": bull_fvg_gap,
+                    "confluence": "15m SSL Sweep + 5m Body CHoCH + Bullish FVG Tap"
                 }
 
-    # --- BEARISH SMC SETUP (SELL) ---
-    # FVG condition: c1['low'] > c3['high']
-    bear_fvg_gap = c1['low'] - c3['high']
-    ltf_swing_low = df_ltf.iloc[-12:-4]['low'].min()
-    choch_bearish = c2['close'] < ltf_swing_low  # Displacement break below swing low
+    # --- 2. BEARISH SETUP ---
+    bearish_choch = c1['close'] < ltf_swing_low
+    bear_fvg_gap = c0['low'] - c2['high']
 
-    if (bearish_sweep or choch_bearish) and (bear_fvg_gap >= cfg['min_fvg']):
-        fvg_mid = c3['high'] + (bear_fvg_gap * 0.5)
-        if c3['high'] >= c3['low'] and curr_price <= fvg_mid:
-            sl_price = round(max(c2['high'], c3['high']) + cfg['sl_buf'], 2)
-            risk_dist = sl_price - curr_price
-            if risk_dist > 0:
-                tp_price = round(curr_price - (risk_dist * cfg['rr']), 2)
+    if htf_bsl_sweep and bearish_choch and (bear_fvg_gap >= cfg['min_fvg']):
+        fvg_top = c0['low']
+        fvg_bottom = c2['high']
+        # Price must be actively retesting the FVG zone
+        if fvg_bottom <= curr_price <= fvg_top:
+            sl = round(ltf_swing_high + cfg['sl_buf'], 2)
+            risk = sl - curr_price
+            if risk > 0:
+                tp = round(curr_price - (risk * cfg['rr']), 2)
                 return {
                     "side": "SHORT",
-                    "entry": round(curr_price, 2),
-                    "sl": sl_price,
-                    "tp": tp_price,
-                    "risk": round(risk_dist, 2),
-                    "target_gain": round(risk_dist * cfg['rr'], 2),
-                    "confluence": "15m BSL Sweep + 5m CHoCH + Bearish FVG Tap"
+                    "entry": curr_price,
+                    "sl": sl,
+                    "tp": tp,
+                    "fvg_size": bear_fvg_gap,
+                    "confluence": "15m BSL Sweep + 5m Body CHoCH + Bearish FVG Tap"
                 }
 
     return None
 
-def smc_scanner_worker():
-    print("SMC/ICT Multi-Timeframe Master Engine Live...", flush=True)
+# ----------------- SCANNER WORKER -----------------
+def scanner_worker():
+    print("🚀 Strict SMC & ICT Crypto/Gold Scanner Started...", flush=True)
     send_telegram_alert(
         "🏛️ *SMC & ICT MASTER STRATEGY ACTIVE!*\n\n"
         "• *HTF Structure:* 15m Liquidity Sweeps (BSL/SSL)\n"
-        "• *LTF Execution:* 5m CHoCH + Fair Value Gap (FVG)\n"
+        "• *LTF Execution:* 5m Body CHoCH + Fair Value Gap (FVG)\n"
         "• *Risk:Reward:* Minimum 1:2 RR\n"
         "• *Pairs:* BTC, ETH, SOL, GOLD (PAXG)"
     )
 
     while True:
         try:
-            ist = pytz.timezone('Asia/Kolkata')
-            now_ist = datetime.now(ist)
+            for pair, cfg in PAIRS.items():
+                now = time.time()
+                if (now - last_signal_time[pair]) < (COOLDOWN_MINUTES * 60):
+                    continue
 
-            for symbol, cfg in ASSETS.items():
-                df_ltf = fetch_data(symbol, LTF_TIMEFRAME, 50)
-                time.sleep(1)
-                df_htf = fetch_data(symbol, HTF_TIMEFRAME, 50)
+                df_htf = fetch_candles(pair, timeframe='15m', limit=30)
+                time.sleep(0.5)
+                df_ltf = fetch_candles(pair, timeframe='5m', limit=30)
+                time.sleep(0.5)
 
-                if df_ltf is not None and df_htf is not None:
-                    last_candle_time = df_ltf.iloc[-1]['timestamp']
+                if df_htf is None or df_ltf is None:
+                    continue
 
-                    # Synchronize with fresh candle close
-                    if last_checked_candles[symbol] != last_candle_time:
-                        cooldown_passed = True
-                        if last_trade_times[symbol]:
-                            passed = (now_ist - last_trade_times[symbol]).total_seconds() / 60
-                            if passed < COOLDOWN_MINUTES:
-                                cooldown_passed = False
+                setup = check_smc_setup(df_htf, df_ltf, cfg)
+                if setup:
+                    signal_counters[pair] += 1
+                    last_signal_time[pair] = now
 
-                        if cooldown_passed:
-                            signal = check_smc_setup(df_htf, df_ltf, cfg)
-                            if signal:
-                                trade_counts[symbol] += 1
-                                last_trade_times[symbol] = now_ist
-                                last_checked_candles[symbol] = last_candle_time
+                    icon = "🟢" if setup['side'] == "LONG" else "🔴"
+                    profit_delta = round(abs(setup['tp'] - setup['entry']), 2)
+                    loss_delta   = round(abs(setup['entry'] - setup['sl']), 2)
 
-                                icon = "🟢" if signal['side'] == "LONG" else "🔴"
+                    msg = (
+                        f"{icon} *SMC/ICT INSTITUTIONAL {setup['side']} #{signal_counters[pair]}* {icon}\n\n"
+                        f"🔹 *Asset:* {cfg['name']}\n"
+                        f"🔹 *Confluence:* {setup['confluence']}\n"
+                        f"🔹 *Entry Price:* ${setup['entry']:,.2f}\n"
+                        f"🎯 *Take Profit:* ${setup['tp']:,.2f} (+${profit_delta})\n"
+                        f"🛑 *Stop Loss:* ${setup['sl']:,.2f} (-${loss_delta})\n"
+                        f"⚖️️ *Risk:Reward:* 1:{cfg['rr']}\n\n"
+                        f"📌 *Execution Rule:* Trail SL to Entry at 1:1 reward. Hold balance till opposing liquidity."
+                    )
+                    send_telegram_alert(msg)
 
-                                alert_msg = (
-                                    f"{icon} *SMC/ICT INSTITUTIONAL {signal['side']} #{trade_counts[symbol]}* {icon}\n\n"
-                                    f"🔹 *Asset:* `{symbol}` ({cfg['name']})\n"
-                                    f"🔹 *Confluence:* _{signal['confluence']}_\n"
-                                    f"🔹 *Entry Price:* ${signal['entry']:,.2f}\n"
-                                    f"🎯 *Take Profit:* ${signal['tp']:,.2f} (+${signal['target_gain']})\n"
-                                    f"🛑 *Stop Loss:* ${signal['sl']:,.2f} (-${signal['risk']})\n"
-                                    f"⚖️ *Risk:Reward:* `1:{cfg['rr']}`\n\n"
-                                    f"📌 *Execution Rule:* Trail SL to Entry at 1:1 reward. Hold balance till opposing liquidity."
-                                )
-                                send_telegram_alert(alert_msg)
-
-                time.sleep(2)
-
-            print(f"[{now_ist.strftime('%H:%M:%S')}] SMC 15m/5m Confluence Scanned | All Active", flush=True)
-            time.sleep(20)
+            time.sleep(25)
 
         except Exception as e:
-            print(f"SMC Loop Error: {e}", flush=True)
-            time.sleep(10)
+            print(f"Scanner Exception: {e}", flush=True)
+            time.sleep(15)
 
+# ----------------- UPTIME HEALTH CHECK SERVER -----------------
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header('Content-type', 'text/plain')
         self.end_headers()
         self.wfile.write(b"SMC Multi-Timeframe Bot Healthy!")
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
 
     def log_message(self, format, *args):
         return
@@ -203,6 +217,6 @@ def run_server():
     server.serve_forever()
 
 if __name__ == "__main__":
-    t = threading.Thread(target=smc_scanner_worker, daemon=True)
+    t = threading.Thread(target=scanner_worker, daemon=True)
     t.start()
     run_server()
