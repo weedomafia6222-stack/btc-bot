@@ -9,19 +9,19 @@ import requests
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ----------------- CONFIGURATION -----------------
-TELEGRAM_BOT_TOKEN = "8608122374:AAF5OXFFo4pKrhda8RyThOCs9dN0zkd0V14"    # Apna Telegram Bot Token dalein
-TELEGRAM_CHAT_ID   = "1327677831"      # Apna Telegram Chat ID dalein
+TELEGRAM_BOT_TOKEN = "8608122374:AAF5OXFFo4pKrhda8RyThOCs9dN0zkd0V14"    # Apna Bot Token dalein
+TELEGRAM_CHAT_ID   = "1327677831"      # Apna Chat ID dalein
 
 SYMBOL = "BTC/USDT"
 TIMEFRAME = "5m"
-EMA_PERIOD = 50          # Scalping friendly trend filter
+EMA_PERIOD = 50          # Dynamic EMA trend filter
 SWING_LOOKBACK = 8       # 40-minute lookback for active sweeps
 RR_RATIO = 1.3
 COOLDOWN_MINUTES = 12
 
-exchange = ccxt.binance({
-    'enableRateLimit': True,
-    'options': {'defaultType': 'spot'}
+# Coinbase bilkul US cloud-friendly hai (Zero Location Block)
+exchange = ccxt.coinbase({
+    'enableRateLimit': True
 })
 
 def send_telegram_alert(message):
@@ -38,7 +38,6 @@ def send_telegram_alert(message):
 
 def fetch_btc_data():
     try:
-        # Last 100 candles
         ohlcv = exchange.fetch_ohlcv(SYMBOL, timeframe=TIMEFRAME, limit=100)
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms').dt.tz_localize('UTC').dt.tz_convert('Asia/Kolkata')
@@ -49,8 +48,8 @@ def fetch_btc_data():
         return None
 
 def btc_scalper_worker():
-    print("🚀 BTC Scalper Engine Started (Active Responsive Mode)...", flush=True)
-    send_telegram_alert("🚀 *BTC/USDT SCALPER ENGAGED!*\nMonitoring 5m sweeps + 50 EMA trend. Live scan active.")
+    print("🚀 BTC Scalper Engine Live (Coinbase Feed - Geo Block Free)...", flush=True)
+    send_telegram_alert("🚀 *BTC/USDT LIVE BOT ENGAGED!*\nBypassed cloud restrictions. Monitoring live 5m candles.")
 
     last_trade_time = None
     trades_count = 0
@@ -67,12 +66,10 @@ def btc_scalper_worker():
                 last_closed = df.iloc[-2]
                 ema_val = last_closed['ema']
 
-                # Recent swing highs and lows
                 recent_high = df['high'].iloc[-(SWING_LOOKBACK + 2):-2].max()
                 recent_low  = df['low'].iloc[-(SWING_LOOKBACK + 2):-2].min()
 
-                # Live heartbeat print (flush=True ensures it appears in Render instantly)
-                print(f"[{now_ist.strftime('%H:%M:%S')}] BTC: ${curr_price:,.2f} | EMA: ${ema_val:,.2f} | High: ${recent_high:,.2f} | Low: ${recent_low:,.2f}", flush=True)
+                print(f"[{now_ist.strftime('%H:%M:%S')}] BTC: ${curr_price:,.2f} | EMA: ${ema_val:,.2f} | Scanning...", flush=True)
 
                 cooldown_passed = True
                 if last_trade_time:
@@ -81,7 +78,7 @@ def btc_scalper_worker():
                         cooldown_passed = False
 
                 if cooldown_passed:
-                    # 1. LONG SETUP: Price > EMA and Sweeps recent low with rejection
+                    # LONG SETUP
                     if (last_closed['close'] > ema_val and 
                         last_closed['low'] < recent_low and 
                         last_closed['close'] > recent_low):
@@ -100,12 +97,12 @@ def btc_scalper_worker():
                             f"🎯 *Take Profit:* ${target_price:,.2f} (+${tp_pts})\n"
                             f"🛑 *Stop Loss:* ${stop_price:,.2f} (-${sl_pts})\n"
                             f"📈 *Trend:* Bullish (> EMA {EMA_PERIOD})\n"
-                            f"📊 *Sweep:* Swept 40m low (${recent_low:,.2f})\n\n"
+                            f"📊 *Sweep:* Swept recent low (${recent_low:,.2f})\n\n"
                             f"⚡ *Tip:* Book 50% profit at 1:1 RR and trail SL to entry."
                         )
                         send_telegram_alert(msg)
 
-                    # 2. SHORT SETUP: Price < EMA and Sweeps recent high with rejection
+                    # SHORT SETUP
                     elif (last_closed['close'] < ema_val and 
                           last_closed['high'] > recent_high and 
                           last_closed['close'] < recent_high):
@@ -124,7 +121,7 @@ def btc_scalper_worker():
                             f"🎯 *Take Profit:* ${target_price:,.2f} (-${tp_pts})\n"
                             f"🛑 *Stop Loss:* ${stop_price:,.2f} (+${sl_pts})\n"
                             f"📉 *Trend:* Bearish (< EMA {EMA_PERIOD})\n"
-                            f"📊 *Sweep:* Swept 40m high (${recent_high:,.2f})\n\n"
+                            f"📊 *Sweep:* Swept recent high (${recent_high:,.2f})\n\n"
                             f"⚡ *Tip:* Book 50% profit at 1:1 RR and trail SL to entry."
                         )
                         send_telegram_alert(msg)
@@ -135,7 +132,6 @@ def btc_scalper_worker():
             print(f"Loop Exception: {e}", flush=True)
             time.sleep(15)
 
-# Render Keep-Alive Port Server
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
