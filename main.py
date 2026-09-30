@@ -98,7 +98,7 @@ def manage_positions_and_pnl(symbol, curr_price):
                 f"1:1 achieved. Stop Loss moved to Entry: ${pos['entry']:,.2f}"
             )
 
-        if curr_price >= pos["target"]:
+        if curr_price <= pos["target"]:
             pnl = pos["qty"] * (pos["entry"] - pos["target"])
             status_reason = "🎯 TARGET HIT"
             closed = True
@@ -183,10 +183,8 @@ def crypto_gold_scanner_worker():
                     is_green = last['close'] > last['open']
                     is_red   = last['close'] < last['open']
 
-                    # Check exits and trailing
                     manage_positions_and_pnl(symbol, curr_price)
 
-                    # Check cooldown
                     cooldown_passed = True
                     if last_trade_times[symbol]:
                         passed = (now_ist - last_trade_times[symbol]).total_seconds() / 60
