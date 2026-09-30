@@ -189,7 +189,7 @@ def crypto_gold_scanner_worker():
                     is_green = last['close'] > last['open']
                     is_red   = last['close'] < last['open']
 
-                    # 1. Check open position exits & trailing
+                    # 1. Manage open positions
                     manage_positions_and_pnl(symbol, curr_price)
 
                     # 2. Check fresh signal setups
