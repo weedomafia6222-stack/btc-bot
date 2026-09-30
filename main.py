@@ -15,15 +15,13 @@ TELEGRAM_CHAT_ID   = "1327677831"      # Chat ID dalein
 TIMEFRAME = "5m"
 EMA_PERIOD = 20
 COOLDOWN_MINUTES = 10
-
 # Multi-Asset Configuration
 ASSETS = {
-    "BTC/USDT":  {"name": "BITCOIN",  "zone": 35.0, "sl_buf": 30.0, "rr": 1.3},
-    "ETH/USDT":  {"name": "ETHEREUM", "zone": 4.0,  "sl_buf": 3.0,  "rr": 1.4},
-    "SOL/USDT":  {"name": "SOLANA",   "zone": 0.4,  "sl_buf": 0.35, "rr": 1.4},
-    "PAXG/USDT": {"name": "GOLD (PAXG)", "zone": 3.0, "sl_buf": 2.5, "rr": 1.4}
+    "BTC/USDT":  {"name": "BITCOIN",    "zone": 35.0, "sl_buf": 30.0, "rr": 1.3},
+    "ETH/USDT":  {"name": "ETHEREUM",   "zone": 4.0,  "sl_buf": 3.0,  "rr": 1.4},
+    "SOL/USDT":  {"name": "SOLANA",     "zone": 0.4,  "sl_buf": 0.35, "rr": 1.4},
+    "PAXG/USD":  {"name": "GOLD (SPOT)", "zone": 3.0,  "sl_buf": 2.5,  "rr": 1.4}
 }
-
 exchange = ccxt.coinbase({'enableRateLimit': True})
 last_trade_times = {symbol: None for symbol in ASSETS}
 trade_counts = {symbol: 0 for symbol in ASSETS}
