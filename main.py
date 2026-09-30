@@ -9,16 +9,16 @@ import requests
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ----------------- CONFIGURATION -----------------
-TELEGRAM_BOT_TOKEN = "8608122374:AAF5OXFFo4pKrhda8RyThOCs9dN0zkd0V14"    # Apna Bot Token dalein
-TELEGRAM_CHAT_ID   = "1327677831"      # Apna Chat ID dalein
+TELEGRAM_BOT_TOKEN = "8608122374:AAF5OXFFo4pKrhda8RyThOCs9dN0zkd0V14"    # Token yahan dalein
+TELEGRAM_CHAT_ID   = "1327677831"      # Chat ID yahan dalein
 
 TIMEFRAME = "5m"
 EMA_PERIOD = 20
 COOLDOWN_MINUTES = 10
 
-# Realistic Virtual Capital & Risk Management Settings
-STARTING_BALANCE = 1000.0    # $1,000 USDT Realistic Initial Capital
-RISK_PER_TRADE_USD = 15.0    # Har trade par strictly 1.5% ($15) ka risk
+# Realistic Virtual Capital & Risk Settings
+STARTING_BALANCE = 1000.0    # $1,000 Initial Virtual Capital
+RISK_PER_TRADE_USD = 15.0    # 1.5% fixed risk per trade
 
 ASSETS = {
     "BTC/USDT":  {"name": "BITCOIN",    "zone": 35.0, "sl_buf": 30.0, "rr": 1.3},
@@ -31,7 +31,7 @@ public_exchange = ccxt.coinbase({'enableRateLimit': True})
 last_trade_times = {symbol: None for symbol in ASSETS}
 trade_counts = {symbol: 0 for symbol in ASSETS}
 
-# Performance & Live PnL State Tracker
+# In-Memory Performance & PnL Engine
 pnl_tracker = {
     "current_balance": STARTING_BALANCE,
     "total_trades": 0,
@@ -67,48 +67,42 @@ def manage_positions_and_pnl(symbol, curr_price):
     pnl = 0.0
     status_reason = ""
 
-    # LONG Position Management
+    # LONG Position
     if pos["type"] == "LONG":
-        # Trailing SL to Entry at 1:1 RR
         if not pos["trailed"] and curr_price >= (pos["entry"] + pos["sl_distance"]):
             pos["stop_loss"] = pos["entry"]
             pos["trailed"] = True
             send_telegram_alert(
                 f"🛡️ *TRAIL TO COST ({pos['name']})*\n"
-                f"Price achieved 1:1 reward. Stop Loss trailed to Entry: `${pos['entry']:,.2f}` (Trade is now 100% Risk-Free)."
+                f"1:1 achieved. Stop Loss moved to Entry: ${pos['entry']:,.2f}"
             )
 
-        # Take Profit Hit
         if curr_price >= pos["target"]:
             pnl = pos["qty"] * (pos["target"] - pos["entry"])
             status_reason = "🎯 TARGET HIT"
             closed = True
             pnl_tracker["wins"] += 1
-        # Stop Loss Hit
         elif curr_price <= pos["stop_loss"]:
             pnl = pos["qty"] * (pos["stop_loss"] - pos["entry"])
             status_reason = "🛑 STOP LOSS HIT"
             closed = True
             pnl_tracker["losses"] += 1
 
-    # SHORT Position Management
+    # SHORT Position
     elif pos["type"] == "SHORT":
-        # Trailing SL to Entry at 1:1 RR
         if not pos["trailed"] and curr_price <= (pos["entry"] - pos["sl_distance"]):
             pos["stop_loss"] = pos["entry"]
             pos["trailed"] = True
             send_telegram_alert(
                 f"🛡️ *TRAIL TO COST ({pos['name']})*\n"
-                f"Price achieved 1:1 reward. Stop Loss trailed to Entry: `${pos['entry']:,.2f}` (Trade is now 100% Risk-Free)."
+                f"1:1 achieved. Stop Loss moved to Entry: ${pos['entry']:,.2f}"
             )
 
-        # Take Profit Hit
         if curr_price <= pos["target"]:
             pnl = pos["qty"] * (pos["entry"] - pos["target"])
             status_reason = "🎯 TARGET HIT"
             closed = True
             pnl_tracker["wins"] += 1
-        # Stop Loss Hit
         elif curr_price >= pos["stop_loss"]:
             pnl = pos["qty"] * (pos["entry"] - pos["stop_loss"])
             status_reason = "🛑 STOP LOSS HIT"
@@ -128,15 +122,15 @@ def manage_positions_and_pnl(symbol, curr_price):
 
         report_msg = (
             f"{res_icon} *TRADE CLOSED: {status_reason}*\n\n"
-            f"🔹 *Asset:* `{symbol}` ({pos['type']})\n"
+            f"🔹 *Asset:* {symbol} ({pos['type']})\n"
             f"🔹 *Entry:* ${pos['entry']:,.2f} \vert{} *Exit:*${curr_price:,.2f}\n"
             f"💵 *Trade PnL:* {pnl_sign}${pnl:,.2f}\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"📊 *PERFORMANCE SCORECARD:*\n"
-            f"• *Accuracy (Win-Rate):* `{win_rate:.1f}%` ({pnl_tracker['wins']}W / {pnl_tracker['losses']}L)\n"
-            f"• *Total Completed Trades:* `{pnl_tracker['total_trades']}`\n"
-            f"• *Total Net PnL:* `{'+' if net_profit_usd >= 0 else ''}${net_profit_usd:,.2f} ({'+' if net_profit_pct >= 0 else ''}{net_profit_pct:.2f}%)`\n"
-            f"• *Current Portfolio Balance:* `${pnl_tracker['current_balance']:,.2f}`"
+            f"• *Accuracy (Win-Rate):* {win_rate:.1f}% ({pnl_tracker['wins']}W / {pnl_tracker['losses']}L)\n"
+            f"• *Total Completed Trades:* {pnl_tracker['total_trades']}\n"
+            f"• *Total Net PnL:* {'+' if net_profit_usd >= 0 else ''}${net_profit_usd:,.2f} ({'+' if net_profit_pct >= 0 else ''}{net_profit_pct:.2f}%)\n"
+            f"• *Current Portfolio Balance:* ${pnl_tracker['current_balance']:,.2f}"
         )
         send_telegram_alert(report_msg)
         del pnl_tracker["active_positions"][symbol]
@@ -160,18 +154,18 @@ def execute_auto_trade(symbol, side, entry, sl, tp, name):
 
     fill_msg = (
         f"🤖 *AUTO PAPER ORDER FILLED ({side})*\n"
-        f"• *Asset:* `{symbol}`\n"
-        f"• *Position Size (Qty):* `{qty}`\n"
-        f"• *Max Risk Allocated:* ${RISK_PER_TRADE_USD:.2f} (1.5% of $1,000)"
+        f"• *Asset:* {symbol}\n"
+        f"• *Position Size (Qty):* {qty}\n"
+        f"• *Allocated Risk:* ${RISK_PER_TRADE_USD:.2f} (1.5% of $1,000)"
     )
     send_telegram_alert(fill_msg)
 
 def crypto_gold_scanner_worker():
-    print("🚀 Scanner & Performance Engine Live with $1,000 Capital...", flush=True)
+    print("Starting Crypto and Gold Paper Engine...", flush=True)
     send_telegram_alert(
         f"🌍 *CRYPTO & GOLD AUTO-PAPER TRADER ACTIVE!*\n\n"
         f"💼 *Starting Balance:* ${STARTING_BALANCE:,.2f}\n"
-        f"🎯 *Risk Per Trade:* ${RISK_PER_TRADE_USD:,.2f} (1.5%)\n"
+        f"🎯 *Risk Per Trade:* ${RISK_PER_TRADE_USD:.2f} (1.5%)\n"
         f"Tracking Live Accuracy (Win-Rate %) & Net PnL %"
     )
 
@@ -189,10 +183,8 @@ def crypto_gold_scanner_worker():
                     is_green = last['close'] > last['open']
                     is_red   = last['close'] < last['open']
 
-                    # 1. Manage open positions
                     manage_positions_and_pnl(symbol, curr_price)
 
-                    # 2. Check fresh signal setups
                     cooldown_passed = True
                     if last_trade_times[symbol]:
                         passed = (now_ist - last_trade_times[symbol]).total_seconds() / 60
@@ -200,7 +192,7 @@ def crypto_gold_scanner_worker():
                             cooldown_passed = False
 
                     if cooldown_passed and (symbol not in pnl_tracker["active_positions"]):
-                        # LONG Signal Setup
+                        # LONG Setup
                         if last['close'] > ema_val and last['low'] <= (ema_val + cfg['zone']) and is_green:
                             sl_pts = round(curr_price - last['low'] + cfg['sl_buf'], 2)
                             tp_pts = round(sl_pts * cfg['rr'], 2)
@@ -222,7 +214,7 @@ def crypto_gold_scanner_worker():
                             send_telegram_alert(signal_msg)
                             execute_auto_trade(symbol, "LONG", curr_price, stop_price, target_price, cfg['name'])
 
-                        # SHORT Signal Setup
+                        # SHORT Setup
                         elif last['close'] < ema_val and last['high'] >= (ema_val - cfg['zone']) and is_red:
                             sl_pts = round(last['high'] - curr_price + cfg['sl_buf'], 2)
                             tp_pts = round(sl_pts * cfg['rr'], 2)
@@ -249,7 +241,7 @@ def crypto_gold_scanner_worker():
             time.sleep(12)
 
         except Exception as e:
-            print(f"Scanner Loop Error: {e}", flush=True)
+            print(f"Loop Exception: {e}", flush=True)
             time.sleep(10)
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -257,7 +249,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-type', 'text/plain')
         self.end_headers()
-        self.wfile.write(b"Bot & Engine Running Healthy!")
+        self.wfile.write(b"Bot and Engine Running Healthy!")
 
     def log_message(self, format, *args):
         return
