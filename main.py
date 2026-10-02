@@ -11,7 +11,6 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 TELEGRAM_BOT_TOKEN = "8608122374:AAF5OXFFo4pKrhda8RyThOCs9dN0zkd0V14"
 TELEGRAM_CHAT_ID   = "1327677831"
 
-# 12 Top High-Volume Coins for Steady Signals
 PAIRS = {
     "BTC-USD":   {"name": "BTC/USD",   "atr_mult": 1.3},
     "ETH-USD":   {"name": "ETH/USD",   "atr_mult": 1.4},
@@ -60,7 +59,6 @@ def compute_indicators(df):
     df['ema9'] = df['close'].ewm(span=9, adjust=False).mean()
     df['ema21'] = df['close'].ewm(span=21, adjust=False).mean()
     
-    # ATR (14) for Dynamic Structural Stop Loss
     high = df['high']
     low = df['low']
     close_prev = df['close'].shift(1)
@@ -74,9 +72,9 @@ def check_ema_pullback_setup(df, cfg):
 
     df = compute_indicators(df)
 
-    p2 = df.iloc[-3]  # Retest/Touch candle
-    p1 = df.iloc[-2]  # Confirmed Confirmation candle
-    curr = df.iloc[-1]  # Active breakout candle
+    p2 = df.iloc[-3]   # Retest candle
+    p1 = df.iloc[-2]   # Confirmation candle
+    curr = df.iloc[-1] # Active breakout candle
 
     curr_price = float(curr['close'])
     atr = float(p1['atr'])
@@ -84,20 +82,23 @@ def check_ema_pullback_setup(df, cfg):
     if pd.isna(atr) or atr <= 0:
         return None
 
-    # --- 1. BULLISH SCALP (9 EMA > 21 EMA Trend Continuation) ---
+    # Micro-Expansion Check: EMAs bilkul flat/zero distance na hon
+    ema_spread = abs(p1['ema9'] - p1['ema21'])
+    if ema_spread < (atr * 0.08):  # Sirf dead flat chop filter hoga, regular signals bilkul effect nahi honge
+        return None
+
+    # --- 1. BULLISH SCALP (9 EMA > 21 EMA) ---
     is_bull_trend = p1['ema9'] > p1['ema21']
-    # Price pulled back to touch the 9-21 EMA value zone
     touched_zone_bull = (p2['low'] <= p2['ema9']) or (p1['low'] <= p1['ema9'])
-    # Confirmation: Strong Green Candle closing above EMA 9
     bull_confirmation = (p1['close'] > p1['open']) and (p1['close'] > p1['ema9'])
-    # Active breakout above the confirmation candle high
+    
     if is_bull_trend and touched_zone_bull and bull_confirmation:
         if curr_price > p1['high']:
             sl = round(min(p1['low'], p2['low']) - (atr * cfg['atr_mult']), 4)
             risk = round(curr_price - sl, 4)
             if risk > 0:
-                tp1 = round(curr_price + risk, 4)          # 1:1 Quick Target
-                tp2 = round(curr_price + (risk * 1.5), 4)   # 1:1.5 Runner
+                tp1 = round(curr_price + risk, 4)
+                tp2 = round(curr_price + (risk * 1.5), 4)
                 return {
                     "side": "LONG",
                     "entry": curr_price,
@@ -109,20 +110,18 @@ def check_ema_pullback_setup(df, cfg):
                     "reward2": round(risk * 1.5, 4)
                 }
 
-    # --- 2. BEARISH SCALP (9 EMA < 21 EMA Trend Continuation) ---
+    # --- 2. BEARISH SCALP (9 EMA < 21 EMA) ---
     is_bear_trend = p1['ema9'] < p1['ema21']
-    # Price pulled back to touch the 9-21 EMA value zone
     touched_zone_bear = (p2['high'] >= p2['ema9']) or (p1['high'] >= p1['ema9'])
-    # Confirmation: Strong Red Candle closing below EMA 9
     bear_confirmation = (p1['close'] < p1['open']) and (p1['close'] < p1['ema9'])
-    # Active breakout below the confirmation candle low
+    
     if is_bear_trend and touched_zone_bear and bear_confirmation:
         if curr_price < p1['low']:
             sl = round(max(p1['high'], p2['high']) + (atr * cfg['atr_mult']), 4)
             risk = round(sl - curr_price, 4)
             if risk > 0:
-                tp1 = round(curr_price - risk, 4)          # 1:1 Quick Target
-                tp2 = round(curr_price - (risk * 1.5), 4)   # 1:1.5 Runner
+                tp1 = round(curr_price - risk, 4)
+                tp2 = round(curr_price - (risk * 1.5), 4)
                 return {
                     "side": "SHORT",
                     "entry": curr_price,
@@ -139,12 +138,11 @@ def check_ema_pullback_setup(df, cfg):
 def run_scanner():
     print("🚀 Active Trend-Pullback Scalper Live...", flush=True)
     send_telegram_alert(
-        "⚡ *ACTIVE TREND-SCALPER ACTIVATED!*\n\n"
-        "• *Universe:* 12 High-Volume Liquid Coins\n"
-        "• *Strategy:* EMA 9/21 Dynamic Value Zone Pullback\n"
-        "• *Execution:* Breakout with Confirmed Closed Retest\n"
-        "• *Target Plan:* 1:1 (Quick Lock) & 1:1.5 (Runner)\n"
-        "• *Expected Frequency:* 6–10 High-Quality Signals/Day"
+        "⚡ *ACTIVE VIP SCALPER ONLINE!*\n\n"
+        "• *Universe:* 12 High-Volume Coins\n"
+        "• *Strategy:* Dynamic Value Zone Pullback\n"
+        "• *Execution:* Retest Confirmation Breakout\n"
+        "• *Target:* 1:1 Fast Scalp Focus"
     )
 
     while True:
