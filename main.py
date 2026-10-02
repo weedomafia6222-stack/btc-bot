@@ -48,7 +48,7 @@ def fetch_candles_coinbase(product_id, granularity=300):
         res = requests.get(url, headers=headers, timeout=7)
         if res.status_code == 200:
             raw = res.json()
-            if isinstance(raw, list) and len(raw) >= 25:
+            if isinstance(raw, list) and len(raw) >= 20:
                 df = pd.DataFrame(raw, columns=['timestamp', 'low', 'high', 'open', 'close', 'volume'])
                 df = df.sort_values('timestamp').reset_index(drop=True)
                 return df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
@@ -69,14 +69,14 @@ def compute_indicators(df):
     df['atr'] = tr.rolling(14).mean()
     return df
 
-def check_unified_setup(df_5m, df_30m, cfg):
-    if df_5m is None or len(df_5m) < 25 or df_30m is None or len(df_30m) < 22:
+def check_unified_setup(df_5m, df_1h, cfg):
+    if df_5m is None or len(df_5m) < 25 or df_1h is None or len(df_1h) < 20:
         return None
 
-    # 1. 30M Macro Trend Bias
-    df_30m['ema21'] = df_30m['close'].ewm(span=21, adjust=False).mean()
-    macro_bull = df_30m['close'].iloc[-1] > df_30m['ema21'].iloc[-1]
-    macro_bear = df_30m['close'].iloc[-1] < df_30m['ema21'].iloc[-1]
+    # 1. 1-Hour Macro Trend Bias (Coinbase native 3600s bucket)
+    df_1h['ema21'] = df_1h['close'].ewm(span=21, adjust=False).mean()
+    macro_bull = df_1h['close'].iloc[-1] > df_1h['ema21'].iloc[-1]
+    macro_bear = df_1h['close'].iloc[-1] < df_1h['ema21'].iloc[-1]
 
     # 2. 5M Structure & Pullback Execution
     df_5m = compute_indicators(df_5m)
@@ -90,17 +90,14 @@ def check_unified_setup(df_5m, df_30m, cfg):
         return None
 
     # ---------------- 1. BUY SETUP (LONG) ----------------
-    # 30M Bullish + 5M EMA 9 >= EMA 21 (Short-term trend up)
     if macro_bull and (curr['ema9'] >= curr['ema21']):
-        # Pullback check: Price near or touching EMA9/EMA21 zone
         pullback_tested = (curr['low'] <= curr['ema9'] * 1.0015) or (p1['low'] <= p1['ema9'] * 1.0015)
-        # Momentum check: Green candle continuation
         candle_bullish = curr['close'] >= curr['open']
 
         if pullback_tested and candle_bullish:
             sl = round(min(p1['low'], curr['low']) - (atr * cfg['atr_mult']), 4)
             risk = round(curr_price - sl, 4)
-            if risk > 0 and (risk / curr_price) <= 0.035: # SL <= 3.5% max
+            if risk > 0 and (risk / curr_price) <= 0.035:
                 zone_top = round(curr_price * (1 + cfg['zone_buf']), 4)
                 tp1 = round(curr_price + risk, 4)
                 tp2 = round(curr_price + (risk * 1.6), 4)
@@ -116,11 +113,8 @@ def check_unified_setup(df_5m, df_30m, cfg):
                 }
 
     # ---------------- 2. SELL SETUP (SHORT) ----------------
-    # 30M Bearish + 5M EMA 9 <= EMA 21 (Short-term trend down)
     if macro_bear and (curr['ema9'] <= curr['ema21']):
-        # Pullback check: Price near or touching EMA9/EMA21 zone
         pullback_tested = (curr['high'] >= curr['ema9'] * 0.9985) or (p1['high'] >= p1['ema9'] * 0.9985)
-        # Momentum check: Red candle continuation
         candle_bearish = curr['close'] <= curr['open']
 
         if pullback_tested and candle_bearish:
@@ -144,7 +138,7 @@ def check_unified_setup(df_5m, df_30m, cfg):
     return None
 
 def run_crypto_scanner():
-    print("🚀 Unified Crypto Master Engine Online & Scanning 12 Pairs...", flush=True)
+    print("🚀 Unified Crypto Master Engine Online (5M + 1H Native)...", flush=True)
     scan_round = 0
 
     while True:
@@ -155,12 +149,13 @@ def run_crypto_scanner():
                 if (now - last_signal_time[pair]) < (COOLDOWN_MINUTES * 60):
                     continue
 
+                # 300 = 5m, 3600 = 1h (Native Coinbase API granularity)
                 df_5m = fetch_candles_coinbase(pair, granularity=300)
-                time.sleep(0.25)
-                df_30m = fetch_candles_coinbase(pair, granularity=1800)
-                time.sleep(0.25)
+                time.sleep(0.2)
+                df_1h = fetch_candles_coinbase(pair, granularity=3600)
+                time.sleep(0.2)
 
-                setup = check_unified_setup(df_5m, df_30m, cfg)
+                setup = check_unified_setup(df_5m, df_1h, cfg)
                 if setup:
                     last_signal_time[pair] = now
                     msg = (
@@ -170,15 +165,14 @@ def run_crypto_scanner():
                         f"🎯 *Target 1 (1:1):* `${setup['tp1']:,.4f}` (Book 70%)\n"
                         f"🎯 *Target 2 (Runner):* `${setup['tp2']:,.4f}`\n\n"
                         f"⚠️ *Client Execution Rules:*\n"
-                        f"1. Agar price Entry Zone se aage nikal chuki ho toh chase mat karein.\n"
-                        f"2. Target 1 aate hi Stop Loss seedha Entry par drag karein.\n"
-                        f"3. Leverage: 5x – 10x max."
+                        f"1. Price Entry Zone se cross hone par trade chase na karein.\n"
+                        f"2. Target 1 hit hote hi Stop Loss entry par le aayein.\n"
+                        f"3. Suggested Leverage: 5x – 10x max."
                     )
                     send_telegram_alert(msg)
 
-            # Heartbeat har 3 scans ke baad
             if scan_round % 3 == 0:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] Active Scan #{scan_round} OK. All 12 pairs monitored.", flush=True)
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Active Scan #{scan_round} OK. All 12 pairs processed without errors.", flush=True)
 
             time.sleep(15)
 
