@@ -11,10 +11,19 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 TELEGRAM_BOT_TOKEN = "8608122374:AAF5OXFFo4pKrhda8RyThOCs9dN0zkd0V14"
 TELEGRAM_CHAT_ID   = "1327677831"
 
-# Pairs to scan for SMC Liquidity Sweeps
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
-COOLDOWN_MINUTES = 45
-last_signal_tracker = {s: 0 for s in SYMBOLS}
+PAIRS = {
+    "BTC-USD":  {"name": "BTC/USDT",  "pip_dec": 2, "max_sl_pct": 0.025},
+    "ETH-USD":  {"name": "ETH/USDT",  "pip_dec": 2, "max_sl_pct": 0.028},
+    "SOL-USD":  {"name": "SOL/USDT",  "pip_dec": 3, "max_sl_pct": 0.035},
+    "XRP-USD":  {"name": "XRP/USDT",  "pip_dec": 4, "max_sl_pct": 0.035},
+    "DOGE-USD": {"name": "DOGE/USDT", "pip_dec": 4, "max_sl_pct": 0.040},
+    "NEAR-USD": {"name": "NEAR/USDT", "pip_dec": 4, "max_sl_pct": 0.038},
+    "SUI-USD":  {"name": "SUI/USDT",  "pip_dec": 4, "max_sl_pct": 0.040},
+    "LINK-USD": {"name": "LINK/USDT", "pip_dec": 3, "max_sl_pct": 0.035}
+}
+
+COOLDOWN_MINUTES = 20
+last_signal_time = {pair: 0 for pair in PAIRS}
 
 def send_telegram_alert(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -28,133 +37,177 @@ def send_telegram_alert(message):
     except Exception as e:
         print(f"Telegram Alert Error: {e}", flush=True)
 
-def fetch_candles(symbol, interval="15m", limit=40):
-    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
+def fetch_candles(product_id, granularity=300):
+    url = f"https://api.exchange.coinbase.com/products/{product_id}/candles?granularity={granularity}"
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
         res = requests.get(url, headers=headers, timeout=7)
         if res.status_code == 200:
             raw = res.json()
-            if isinstance(raw, list) and len(raw) >= 25:
-                df = pd.DataFrame(raw, columns=[
-                    'timestamp', 'open', 'high', 'low', 'close', 'volume',
-                    'close_time', 'qav', 'num_trades', 'taker_base_vol', 'taker_quote_vol', 'ignore'
-                ])
-                df = df.iloc[:-1]  # Exclude live candle
-                for col in ['open', 'high', 'low', 'close', 'volume']:
-                    df[col] = df[col].astype(float)
+            if isinstance(raw, list) and len(raw) >= 30:
+                df = pd.DataFrame(raw, columns=['timestamp', 'low', 'high', 'open', 'close', 'volume'])
+                df = df.sort_values('timestamp').reset_index(drop=True)
                 return df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
     except Exception as e:
-        print(f"Fetch Error ({symbol}): {e}", flush=True)
+        print(f"Fetch Error ({product_id}): {e}", flush=True)
     return None
 
-def check_liquidity_sweep(df, symbol):
-    if df is None or len(df) < 25:
+def get_market_structure(df_15m):
+    """
+    15M Structural Bias: Detects Higher-Highs (Bullish) or Lower-Lows (Bearish)
+    without lagging indicators.
+    """
+    recent = df_15m.iloc[-14:-1] # Last 13 closed 15m candles (~3.2 hours)
+    half = len(recent) // 2
+    
+    first_half_high = recent['high'].iloc[:half].max()
+    second_half_high = recent['high'].iloc[half:].max()
+    first_half_low = recent['low'].iloc[:half].min()
+    second_half_low = recent['low'].iloc[half:].min()
+
+    # Higher Highs & Higher Lows = Pure Bullish
+    if second_half_high > first_half_high and second_half_low >= first_half_low:
+        return "BULLISH"
+    # Lower Lows & Lower Highs = Pure Bearish
+    elif second_half_low < first_half_low and second_half_high <= first_half_high:
+        return "BEARISH"
+    
+    # Neutral filter
+    return "BULLISH" if df_15m['close'].iloc[-2] > df_15m['open'].iloc[-6] else "BEARISH"
+
+def check_price_action_setup(df_exec, macro_bias, cfg):
+    """
+    Volume-Confirmed 5M Break of Structure (BOS)
+    - Closed candle verification (Zero Repainting)
+    - 15-period structural swing pivots
+    - Volume surge verification
+    """
+    if df_exec is None or len(df_exec) < 30:
         return None
 
-    # Reference range (prior 20 candles excluding recent 2)
-    lookback = df.iloc[-22:-2]
-    key_high = lookback['high'].max()
-    key_low = lookback['low'].min()
+    lookback = 15
+    # Window looking strictly before the last closed candle
+    window = df_exec.iloc[-(lookback + 2):-2]
+    
+    swing_high = float(window['high'].max())
+    swing_low = float(window['low'].min())
 
-    # The sweep candle (previous candle)
-    sweep_candle = df.iloc[-2]
-    # The confirmation candle (last closed candle)
-    confirm_candle = df.iloc[-1]
+    # Strictly evaluate the LAST CLOSED CANDLE (iloc[-2])
+    confirmed = df_exec.iloc[-2]
+    close_price = float(confirmed['close'])
+    open_price = float(confirmed['open'])
+    vol = float(confirmed['volume'])
+    
+    # Volume check: Breakout candle volume must exceed 20-period average volume by 25%
+    avg_vol = float(df_exec['volume'].iloc[-18:-2].mean())
+    volume_surge = vol > (avg_vol * 1.25)
 
-    # --- BEARISH SWEEP (Top Liquidity Hunt / Supply Rejection) ---
-    # 1. Sweep candle ne High ko break kiya, par close key_high ke niche hua (wick sweep)
-    # 2. Confirm candle bearish hai (close < open) aur price rejection validate karti hai
-    if (sweep_candle['high'] > key_high and sweep_candle['close'] < key_high and
-        confirm_candle['close'] < confirm_candle['open']):
-        
-        entry = float(confirm_candle['close'])
-        sl = float(round(sweep_candle['high'] * 1.0015, 2))  # Thoda sa buffer wick ke upar
-        risk = round(sl - entry, 2)
-        
-        if risk > 0:
-            tp1 = round(entry - (risk * 1.5), 2)  # 1:1.5 RR (Partial)
-            tp2 = round(entry - (risk * 3.0), 2)  # 1:3.0 RR (Target)
-            
-            return {
-                "symbol": symbol,
-                "side": "SELL (SHORT)",
-                "icon": "🔴",
-                "entry": entry,
-                "sl": sl,
-                "tp1": tp1,
-                "tp2": tp2,
-                "risk": risk,
-                "rr": "1:3.0",
-                "swept_level": round(key_high, 2)
-            }
+    dec = cfg['pip_dec']
 
-    # --- BULLISH SWEEP (Bottom Liquidity Hunt / Demand Rejection) ---
-    # 1. Sweep candle ne Low ko sweep kiya, par close key_low ke upar hua
-    # 2. Confirm candle bullish hai (close > open)
-    if (sweep_candle['low'] < key_low and sweep_candle['close'] > key_low and
-        confirm_candle['close'] > confirm_candle['open']):
-        
-        entry = float(confirm_candle['close'])
-        sl = float(round(sweep_candle['low'] * 0.9985, 2))  # Buffer below wick
-        risk = round(entry - sl, 2)
-        
-        if risk > 0:
-            tp1 = round(entry + (risk * 1.5), 2)
-            tp2 = round(entry + (risk * 3.0), 2)
-            
-            return {
-                "symbol": symbol,
-                "side": "BUY (LONG)",
-                "icon": "🟢",
-                "entry": entry,
-                "sl": sl,
-                "tp1": tp1,
-                "tp2": tp2,
-                "risk": risk,
-                "rr": "1:3.0",
-                "swept_level": round(key_low, 2)
-            }
+    # ---------------- 1. CONFIRMED BUY SETUP ----------------
+    if macro_bias == "BULLISH" and volume_surge:
+        # Solid green candle closing clean above swing high
+        if close_price > swing_high and close_price > open_price:
+            # 0.35% protective buffer below swing low
+            sl = round(swing_low * 0.9965, dec)
+            risk = round(close_price - sl, dec)
+            risk_pct = risk / close_price
+
+            if 0.0035 <= risk_pct <= cfg['max_sl_pct']:
+                tp1 = round(close_price + (risk * 1.2), dec)
+                tp2 = round(close_price + (risk * 2.0), dec)
+                return {
+                    "side": "BUY (LONG)",
+                    "icon": "🟢",
+                    "entry": close_price,
+                    "sl": sl,
+                    "tp1": tp1,
+                    "tp2": tp2,
+                    "risk": risk,
+                    "structure_break": swing_high,
+                    "bias": macro_bias
+                }
+
+    # ---------------- 2. CONFIRMED SELL SETUP ----------------
+    if macro_bias == "BEARISH" and volume_surge:
+        # Solid red candle closing clean below swing low
+        if close_price < swing_low and close_price < open_price:
+            # 0.35% protective buffer above swing high
+            sl = round(swing_high * 1.0035, dec)
+            risk = round(sl - close_price, dec)
+            risk_pct = risk / close_price
+
+            if 0.0035 <= risk_pct <= cfg['max_sl_pct']:
+                tp1 = round(close_price - (risk * 1.2), dec)
+                tp2 = round(close_price - (risk * 2.0), dec)
+                return {
+                    "side": "SELL (SHORT)",
+                    "icon": "🔴",
+                    "entry": close_price,
+                    "sl": sl,
+                    "tp1": tp1,
+                    "tp2": tp2,
+                    "risk": risk,
+                    "structure_break": swing_low,
+                    "bias": macro_bias
+                }
 
     return None
 
-def run_smc_scanner():
-    global last_signal_tracker
-    print("🚀 SMC Liquidity Sweep & Reversal Bot Active...", flush=True)
+def run_price_action_engine():
+    print("⚡ Institutional Volume & Structure Engine Online...", flush=True)
+    send_telegram_alert(
+        "🏛 *UPGRADED INSTITUTIONAL ENGINE ACTIVATED!*\n\n"
+        "• *HTF Filter:* 15M Macro Structure (HH / LL)\n"
+        "• *Execution:* 5M Confirmed Candle Close (No Wicks/Repaint)\n"
+        "• *Volume Gate:* > 1.25x Volume Surge Required\n"
+        "• *Risk Model:* 1:1.2 Fast Scalp & 1:2.0 Expansion Target\n"
+        "• *Volatility Armor:* Wider SL Buffer to prevent spread hunt."
+    )
 
+    cycle = 0
     while True:
         try:
-            now = time.time()
-            for sym in SYMBOLS:
-                if (now - last_signal_tracker[sym]) < (COOLDOWN_MINUTES * 60):
+            cycle += 1
+            for pair, cfg in PAIRS.items():
+                now = time.time()
+                if (now - last_signal_time[pair]) < (COOLDOWN_MINUTES * 60):
                     continue
 
-                df = fetch_candles(sym, interval="15m", limit=30)
-                setup = check_liquidity_sweep(df, sym)
+                # 300 = 5M candles, 900 = 15M candles
+                df_exec = fetch_candles(pair, granularity=300)
+                time.sleep(0.2)
+                df_macro = fetch_candles(pair, granularity=900)
+                time.sleep(0.2)
 
-                if setup:
-                    last_signal_tracker[sym] = now
-                    msg = (
-                        f"{setup['icon']} *SMC SNIPER SETUP: {setup['symbol']}* {setup['icon']}\n\n"
-                        f"Action: *{setup['side']}*\n"
-                        f"🔹 *Entry Price:* `${setup['entry']:,.2f}`\n"
-                        f"🛑 *Stop Loss:* `${setup['sl']:,.2f}` (Risk: `${setup['risk']:,.2f}`)\n"
-                        f"🎯 *Target 1 (1:1.5):* `${setup['tp1']:,.2f}` (Safe 60% Book)\n"
-                        f"🎯 *Target 2 (Runner):* `${setup['tp2']:,.2f}` (RR: {setup['rr']})\n\n"
-                        f"🧠 *Smart Money Footprint:*\n"
-                        f"• Swept Liquidity Pivot: `${setup['swept_level']:,.2f}`\n"
-                        f"• Pattern: Trap & Reversal (Wick Hunt)\n\n"
-                        f"⚡ *Rule:* Target 1 aate hi Stop Loss direct entry (Cost) par lock karein."
-                    )
-                    send_telegram_alert(msg)
-                    time.sleep(1)
+                if df_exec is not None and df_macro is not None:
+                    macro_bias = get_market_structure(df_macro)
+                    setup = check_price_action_setup(df_exec, macro_bias, cfg)
 
-                time.sleep(0.5)
+                    if setup:
+                        last_signal_time[pair] = now
+                        msg = (
+                            f"{setup['icon']} *CONFIRMED SETUP: {cfg['name']}* {setup['icon']}\n\n"
+                            f"Action: *{setup['side']}*\n"
+                            f"🔹 *Entry (Closed):* `${setup['entry']:,.4f}`\n"
+                            f"🛑 *Stop Loss:* `${setup['sl']:,.4f}`\n"
+                            f"🎯 *Target 1 (1:1.2):* `${setup['tp1']:,.4f}` (Secure 70%)\n"
+                            f"🎯 *Target 2 (1:2.0):* `${setup['tp2']:,.4f}` (Runner)\n\n"
+                            f"🏛 *Logic Breakdown:*\n"
+                            f"• Macro 15M Bias: *{setup['bias']}*\n"
+                            f"• Pivot Breached: `${setup['structure_break']:,.4f}`\n"
+                            f"• Confirmation: *Confirmed Close + Volume Surge*\n\n"
+                            f"⚡ *Rule:* Target 1 aate hi Stop Loss ko entry price par move karein."
+                        )
+                        send_telegram_alert(msg)
 
-            time.sleep(20)
+            if cycle % 3 == 0:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Volume & Structure Scan Complete. System Healthy.", flush=True)
+
+            time.sleep(15)
 
         except Exception as e:
-            print(f"SMC Scanner Loop Error: {e}", flush=True)
+            print(f"Scanner Exception: {e}", flush=True)
             time.sleep(10)
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -162,7 +215,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-type', 'text/plain')
         self.end_headers()
-        self.wfile.write(b"SMC Liquidity Bot Live!")
+        self.wfile.write(b"Institutional Engine Active & Protected!")
 
     def log_message(self, format, *args):
         return
@@ -173,6 +226,6 @@ def run_server():
     server.serve_forever()
 
 if __name__ == "__main__":
-    t = threading.Thread(target=run_smc_scanner, daemon=True)
+    t = threading.Thread(target=run_price_action_engine, daemon=True)
     t.start()
     run_server()
