@@ -11,20 +11,22 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 TELEGRAM_BOT_TOKEN = "8608122374:AAF5OXFFo4pKrhda8RyThOCs9dN0zkd0V14"
 TELEGRAM_CHAT_ID   = "1327677831"
 
-COOLDOWN_MINUTES = 25  # Ek coin par trade aane ke baad cooldown
+COOLDOWN_MINUTES = 25
 
 CRYPTO_PAIRS = {
     "BTCUSDT": {
         "name": "BITCOIN",
         "symbol": "BTC/USDT",
-        "sl_buf": 60.0,       # $60 buffer below/above wick
-        "min_risk": 150.0,    # Minimum $150 stop loss
-        "max_risk": 550.0,    # Maximum $550 stop loss (wide stop avoid)
+        "coinbase_id": "BTC-USD",
+        "sl_buf": 60.0,
+        "min_risk": 150.0,
+        "max_risk": 550.0,
         "rr": 2.0
     },
     "ETHUSDT": {
         "name": "ETHEREUM",
         "symbol": "ETH/USDT",
+        "coinbase_id": "ETH-USD",
         "sl_buf": 4.0,
         "min_risk": 10.0,
         "max_risk": 45.0,
@@ -33,6 +35,7 @@ CRYPTO_PAIRS = {
     "SOLUSDT": {
         "name": "SOLANA",
         "symbol": "SOL/USDT",
+        "coinbase_id": "SOL-USD",
         "sl_buf": 0.40,
         "min_risk": 1.20,
         "max_risk": 5.0,
@@ -50,15 +53,16 @@ def send_telegram_alert(message):
         "parse_mode": "Markdown"
     }
     try:
-        requests.post(url, data=payload, timeout=8)
+        res = requests.post(url, data=payload, timeout=8)
+        print(f"Telegram Post Status: {res.status_code}", flush=True)
     except Exception as e:
         print(f"Telegram Error: {e}", flush=True)
 
-def fetch_klines(symbol, interval="5m", limit=60):
-    """Real-time live candle fetch from Binance Public API (Zero Delay)"""
+def fetch_klines(symbol, coinbase_id, interval="5m", limit=50):
+    # 1. Try Binance API
     try:
         url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
-        res = requests.get(url, timeout=8)
+        res = requests.get(url, timeout=6)
         if res.status_code == 200:
             raw = res.json()
             df = pd.DataFrame(raw, columns=[
@@ -68,15 +72,32 @@ def fetch_klines(symbol, interval="5m", limit=60):
             for col in ["open", "high", "low", "close", "volume"]:
                 df[col] = df[col].astype(float)
             return df
+    except Exception:
+        pass
+
+    # 2. Fallback to Coinbase API (Global & Unrestricted)
+    try:
+        granularity = 300 if interval == "5m" else 900
+        url = f"https://api.exchange.coinbase.com/products/{coinbase_id}/candles?granularity={granularity}"
+        res = requests.get(url, timeout=6)
+        if res.status_code == 200:
+            raw = res.json()
+            # Coinbase format: [time, low, high, open, close, volume]
+            df = pd.DataFrame(raw, columns=["time", "low", "high", "open", "close", "volume"])
+            df = df.sort_values("time").reset_index(drop=True)
+            for col in ["open", "high", "low", "close", "volume"]:
+                df[col] = df[col].astype(float)
+            return df.tail(limit)
     except Exception as e:
-        print(f"Fetch Error ({symbol} {interval}): {e}", flush=True)
+        print(f"Coinbase Fallback Error ({coinbase_id}): {e}", flush=True)
+
     return None
 
 def check_crypto_setup(df_5m, df_15m, cfg):
-    if df_5m is None or len(df_5m) < 30 or df_15m is None or len(df_15m) < 30:
+    if df_5m is None or len(df_5m) < 25 or df_15m is None or len(df_15m) < 25:
         return None
 
-    # HTF 15M Trend Confirmation
+    # HTF 15M Trend Alignment
     df_15m['ema9'] = df_15m['close'].ewm(span=9, adjust=False).mean()
     df_15m['ema21'] = df_15m['close'].ewm(span=21, adjust=False).mean()
     htf_candle = df_15m.iloc[-2]
@@ -91,11 +112,9 @@ def check_crypto_setup(df_5m, df_15m, cfg):
     prev = df_5m.iloc[-2]  # Confirmed closed candle
     curr = df_5m.iloc[-1]  # Active breakout candle
 
-    # --- 1. LONG / BUY SETUP ---
+    # --- LONG SETUP ---
     if htf_bullish and (prev['ema9'] > prev['ema21']):
-        # Pullback test near EMA 9
         pullback = (prev['low'] <= (prev['ema9'] * 1.002)) and (prev['close'] >= prev['ema9'])
-        # Breakout trigger
         if pullback and (curr['close'] > prev['high']):
             sl = round(prev['low'] - cfg['sl_buf'], 2)
             risk = round(curr['close'] - sl, 2)
@@ -110,11 +129,9 @@ def check_crypto_setup(df_5m, df_15m, cfg):
                     "reward": round(risk * cfg['rr'], 2)
                 }
 
-    # --- 2. SHORT / SELL SETUP ---
+    # --- SHORT SETUP ---
     if htf_bearish and (prev['ema9'] < prev['ema21']):
-        # Pullback test near EMA 9
         pullback = (prev['high'] >= (prev['ema9'] * 0.998)) and (prev['close'] <= prev['ema9'])
-        # Breakdown trigger
         if pullback and (curr['close'] < prev['low']):
             sl = round(prev['high'] + cfg['sl_buf'], 2)
             risk = round(sl - curr['close'], 2)
@@ -132,7 +149,14 @@ def check_crypto_setup(df_5m, df_15m, cfg):
     return None
 
 def crypto_scanner_worker():
-    print("🚀 24/7 Crypto Multi-Coin Scanner Live (BTC, ETH, SOL)...", flush=True)
+    print("🚀 24/7 Crypto Scanner Worker Started...", flush=True)
+    # Instant Telegram Ping to confirm active connection
+    send_telegram_alert(
+        "🚀 *24/7 MULTI-COIN SCANNER ACTIVATED!*\n\n"
+        "🔹 *Assets:* BTC, ETH, SOL\n"
+        "🔹 *Engine:* 15M Trend + 5M 9-EMA Pullback\n"
+        "🔹 *Execution:* 24/7 Continuous Scanning"
+    )
 
     while True:
         try:
@@ -140,15 +164,14 @@ def crypto_scanner_worker():
             now_ist = datetime.now(ist)
 
             for symbol, cfg in CRYPTO_PAIRS.items():
-                # Cooldown check per coin
                 if last_trade_times[symbol]:
                     passed_min = (now_ist - last_trade_times[symbol]).total_seconds() / 60
                     if passed_min < COOLDOWN_MINUTES:
                         continue
 
-                df_5m = fetch_klines(symbol, interval="5m", limit=40)
+                df_5m = fetch_klines(symbol, cfg['coinbase_id'], interval="5m", limit=40)
                 time.sleep(0.3)
-                df_15m = fetch_klines(symbol, interval="15m", limit=40)
+                df_15m = fetch_klines(symbol, cfg['coinbase_id'], interval="15m", limit=40)
                 time.sleep(0.3)
 
                 setup = check_crypto_setup(df_5m, df_15m, cfg)
@@ -162,12 +185,12 @@ def crypto_scanner_worker():
                         f"🎯 *Target (1:{cfg['rr']}):* ${setup['tp']:,.2f} (+${setup['reward']:,.2f})\n"
                         f"🛑 *Stop Loss:* ${setup['sl']:,.2f} (-${setup['risk']:,.2f})\n\n"
                         f"📊 *Strategy:* 15M Trend Alignment + 5M 9 EMA Pullback\n"
-                        f"⚡ *Trade Rule:* Target 1 (1:1 R:R) hit hote hi Stop Loss ko entry/cost par shift karein."
+                        f"⚡ *Rule:* Target 1 (1:1) hit hote hi SL Cost-to-Cost karein."
                     )
                     send_telegram_alert(msg)
-                    print(f"[{now_ist.strftime('%H:%M:%S')}] Alert sent for {symbol}", flush=True)
+                    print(f"[{now_ist.strftime('%H:%M:%S')}] Signal sent: {symbol}", flush=True)
 
-            time.sleep(15)  # Har 15 second mein teeno coins scan honge
+            time.sleep(15)
 
         except Exception as e:
             print(f"Scanner Loop Error: {e}", flush=True)
