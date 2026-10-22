@@ -7,7 +7,7 @@ import pandas as pd
 import requests
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-# ----------------- CONFIGURATION -----------------
+# ----------------- CONFIGURATION (ALERT BOT) -----------------
 TELEGRAM_BOT_TOKEN = "8608122374:AAF5OXFFo4pKrhda8RyThOCs9dN0zkd0V14"
 TELEGRAM_CHAT_ID   = "1327677831"
 
@@ -17,28 +17,28 @@ CRYPTO_PAIRS = {
     "BTCUSDT": {
         "name": "BITCOIN",
         "symbol": "BTC/USDT",
-        "coinbase_id": "BTC-USD",
+        "coinbase_id": "BTC-USDT",
         "sl_buf": 60.0,
-        "min_risk": 150.0,
-        "max_risk": 550.0,
+        "min_risk": 50.0,
+        "max_risk": 700.0,
         "rr": 2.0
     },
     "ETHUSDT": {
         "name": "ETHEREUM",
         "symbol": "ETH/USDT",
-        "coinbase_id": "ETH-USD",
+        "coinbase_id": "ETH-USDT",
         "sl_buf": 4.0,
-        "min_risk": 10.0,
-        "max_risk": 45.0,
+        "min_risk": 2.0,
+        "max_risk": 60.0,
         "rr": 2.0
     },
     "SOLUSDT": {
         "name": "SOLANA",
         "symbol": "SOL/USDT",
-        "coinbase_id": "SOL-USD",
-        "sl_buf": 0.40,
-        "min_risk": 1.20,
-        "max_risk": 5.0,
+        "coinbase_id": "SOL-USDT",
+        "sl_buf": 0.15,
+        "min_risk": 0.30,   # Fixed: Pehle 1.20 tha jisse trades reject ho rahe the
+        "max_risk": 8.0,
         "rr": 2.0
     }
 }
@@ -50,46 +50,54 @@ def send_telegram_alert(message):
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": message,
-        "parse_mode": "Markdown"
+        "parse_mode": "HTML"
     }
     try:
         res = requests.post(url, data=payload, timeout=8)
-        print(f"Telegram Post Status: {res.status_code}", flush=True)
+        if res.status_code != 200:
+            # Fallback plain text if HTML tags ever fail
+            clean_text = message.replace("<b>", "").replace("</b>", "").replace("<code>", "").replace("</code>", "")
+            payload["text"] = clean_text
+            payload.pop("parse_mode", None)
+            requests.post(url, data=payload, timeout=8)
     except Exception as e:
-        print(f"Telegram Error: {e}", flush=True)
+        print(f"Telegram Alert Error: {e}", flush=True)
 
 def fetch_klines(symbol, coinbase_id, interval="5m", limit=50):
-    # 1. Try Binance API
+    granularity = 300 if interval == "5m" else 900
+    
+    # 1. Primary: Coinbase Public API (Zero US IP Blocks on Render)
     try:
-        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
-        res = requests.get(url, timeout=6)
+        url = f"https://api.exchange.coinbase.com/products/{coinbase_id}/candles?granularity={granularity}"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        res = requests.get(url, headers=headers, timeout=5)
         if res.status_code == 200:
             raw = res.json()
-            df = pd.DataFrame(raw, columns=[
-                "open_time", "open", "high", "low", "close", "volume",
-                "close_time", "qav", "num_trades", "taker_base_vol", "taker_quote_vol", "ignore"
-            ])
-            for col in ["open", "high", "low", "close", "volume"]:
-                df[col] = df[col].astype(float)
-            return df
+            if isinstance(raw, list) and len(raw) >= 25:
+                df = pd.DataFrame(raw, columns=["time", "low", "high", "open", "close", "volume"])
+                df = df.sort_values("time").reset_index(drop=True)
+                for col in ["open", "high", "low", "close", "volume"]:
+                    df[col] = df[col].astype(float)
+                return df.tail(limit)
     except Exception:
         pass
 
-    # 2. Fallback to Coinbase API (Global & Unrestricted)
+    # 2. Secondary: Binance Futures Feed (Unrestricted Global Feed)
     try:
-        granularity = 300 if interval == "5m" else 900
-        url = f"https://api.exchange.coinbase.com/products/{coinbase_id}/candles?granularity={granularity}"
-        res = requests.get(url, timeout=6)
+        url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
+        res = requests.get(url, timeout=5)
         if res.status_code == 200:
             raw = res.json()
-            # Coinbase format: [time, low, high, open, close, volume]
-            df = pd.DataFrame(raw, columns=["time", "low", "high", "open", "close", "volume"])
-            df = df.sort_values("time").reset_index(drop=True)
-            for col in ["open", "high", "low", "close", "volume"]:
-                df[col] = df[col].astype(float)
-            return df.tail(limit)
+            if isinstance(raw, list) and len(raw) >= 25:
+                df = pd.DataFrame(raw, columns=[
+                    "open_time", "open", "high", "low", "close", "volume",
+                    "close_time", "qav", "trades", "tb_base", "tb_quote", "ignore"
+                ])
+                for col in ["open", "high", "low", "close", "volume"]:
+                    df[col] = df[col].astype(float)
+                return df
     except Exception as e:
-        print(f"Coinbase Fallback Error ({coinbase_id}): {e}", flush=True)
+        print(f"Data Fetch Error ({symbol}): {e}", flush=True)
 
     return None
 
@@ -149,13 +157,12 @@ def check_crypto_setup(df_5m, df_15m, cfg):
     return None
 
 def crypto_scanner_worker():
-    print("🚀 24/7 Crypto Scanner Worker Started...", flush=True)
-    # Instant Telegram Ping to confirm active connection
+    print("🚀 24/7 Crypto Scanner Worker Started (USDT Native Engine)...", flush=True)
     send_telegram_alert(
-        "🚀 *24/7 MULTI-COIN SCANNER ACTIVATED!*\n\n"
-        "🔹 *Assets:* BTC, ETH, SOL\n"
-        "🔹 *Engine:* 15M Trend + 5M 9-EMA Pullback\n"
-        "🔹 *Execution:* 24/7 Continuous Scanning"
+        "🚀 <b>24/7 MULTI-COIN SCANNER ACTIVATED!</b>\n\n"
+        "🔹 <b>Assets:</b> BTC, ETH, SOL (USDT Native)\n"
+        "🔹 <b>Engine:</b> 15M Trend + 5M 9-EMA Pullback\n"
+        "🔹 <b>Status:</b> Zero Latency Pipeline Connected"
     )
 
     while True:
@@ -170,31 +177,29 @@ def crypto_scanner_worker():
                         continue
 
                 df_5m = fetch_klines(symbol, cfg['coinbase_id'], interval="5m", limit=40)
-                time.sleep(0.3)
                 df_15m = fetch_klines(symbol, cfg['coinbase_id'], interval="15m", limit=40)
-                time.sleep(0.3)
 
                 setup = check_crypto_setup(df_5m, df_15m, cfg)
                 if setup:
                     last_trade_times[symbol] = now_ist
 
                     msg = (
-                        f"⚡ *24/7 CRYPTO SIGNAL: {cfg['name']} ({setup['side']})* ⚡\n\n"
-                        f"📌 *Pair:* `{cfg['symbol']}`\n"
-                        f"🔹 *Entry Price:* ${setup['entry']:,.2f}\n"
-                        f"🎯 *Target (1:{cfg['rr']}):* ${setup['tp']:,.2f} (+${setup['reward']:,.2f})\n"
-                        f"🛑 *Stop Loss:* ${setup['sl']:,.2f} (-${setup['risk']:,.2f})\n\n"
-                        f"📊 *Strategy:* 15M Trend Alignment + 5M 9 EMA Pullback\n"
-                        f"⚡ *Rule:* Target 1 (1:1) hit hote hi SL Cost-to-Cost karein."
+                        f"⚡ <b>24/7 CRYPTO SIGNAL: {cfg['name']} ({setup['side']})</b> ⚡\n\n"
+                        f"📌 <b>Pair:</b> <code>{cfg['symbol']}</code>\n"
+                        f"🔹 <b>Entry Price:</b> ${setup['entry']:,.2f}\n"
+                        f"🎯 <b>Target (1:{cfg['rr']}):</b> ${setup['tp']:,.2f} (+${setup['reward']:,.2f})\n"
+                        f"🛑 <b>Stop Loss:</b> ${setup['sl']:,.2f} (-${setup['risk']:,.2f})\n\n"
+                        f"📊 <b>Strategy:</b> 15M Trend Alignment + 5M 9 EMA Pullback\n"
+                        f"⚡ <b>Rule:</b> Target 1 (1:1) hit hote hi SL Cost-to-Cost karein."
                     )
                     send_telegram_alert(msg)
                     print(f"[{now_ist.strftime('%H:%M:%S')}] Signal sent: {symbol}", flush=True)
 
-            time.sleep(15)
+            time.sleep(12)
 
         except Exception as e:
             print(f"Scanner Loop Error: {e}", flush=True)
-            time.sleep(10)
+            time.sleep(8)
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
